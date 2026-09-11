@@ -14,7 +14,9 @@ Two entirely separate mechanisms are involved:
   album art, completely independent of the CometD channel.
 
 Both ride on the same TCP port (9000), but they are unrelated protocols
-layered on top of it.
+layered on top of it. Steps below are in actual chronological order, with
+each artwork-fetching step placed right after the menu event that
+triggers it.
 
 ---
 
@@ -54,7 +56,7 @@ version) every 60 seconds. The response confirms the test library:
 
 | Request | Purpose |
 |---|---|
-| `/slim/request → ["artworkspec", "add", "225x225_m", "jiveliteskin"]` | Registers the artwork size/format the UI will request — this exact size (`225x225_m`) shows up as the filename suffix on every icon fetch in section 7 |
+| `/slim/request → ["artworkspec", "add", "225x225_m", "jiveliteskin"]` | Registers the artwork size/format the UI will request — this exact size (`225x225_m`) shows up as the filename suffix on every icon fetch in step 5 |
 | `/slim/subscribe → ["menustatus"]` (by player MAC) | Subscribes to changes in the player's menu state |
 | `/slim/subscribe → ["status", "-", 10, "menu:menu", ..., "subscribe:600"]` | Subscribes to ongoing player transport status |
 | `/slim/subscribe → ["displaystatus", "subscribe:showbriefly"]` | Subscribes to display updates |
@@ -68,7 +70,7 @@ version) every 60 seconds. The response confirms the test library:
 Fetches the entire home menu tree in one shot — My Music, Favorites,
 Radio, Settings, Random Mix, Search, and every plugin-contributed entry
 (TuneIn's radio categories, Sounds, RemoteLibrary, MyApps, etc.). This is
-the response that determines what icons need fetching in section 7.
+the response that determines what icons need fetching in step 5.
 
 ```
 /slim/request → ["status", 0, 200, "menu:menu", "useContextMenu:1"]
@@ -76,46 +78,18 @@ the response that determines what icons need fetching in section 7.
 
 Pulls the current player status snapshot for the Now Playing screen.
 
-## 5. Populating My Music → Artists
+## 5. Home menu icon fetching
 
-```
-/slim/request → ["browselibrary", "items", 0, 200,
-                  "role_id:ALBUMARTIST", "mode:artists", "menu:1", ...]
-```
-
-Returned the two artists in the library: **Dylan Scott** and **Jimmy
-Buffet**, plus an "All Albums" entry.
-
-## 6. Drilling into one artist
-
-```
-/slim/request → ["browselibrary", "items", 0, 200,
-                  "role_id:ALBUMARTIST", "mode:albums", "artist_id:3", ...]
-```
-
-`artist_id:3` is Dylan Scott. This returned his one album, **"Livin' My
-Best Life."**
-
-The capture never issues a `mode:tracks` request, so it only shows
-auto-population down through Artists → one artist's Albums — not the
-final drill into that album's track listing (which would be the next
-user click).
-
-## 7. Artwork fetching
-
-Immediately after the home menu tree comes back (section 4), the client
-fires off a batch of plain `GET` requests on port 9000 — ordinary HTTP
-image fetches, unrelated to the CometD channel. All 20 requests below got
-a `200 OK` with real PNG/JPEG image data.
-
-### Menu category icons (`225x225_m`)
-
-One fetch per home-menu item that has an icon — the size matches the
-`artworkspec` registered in section 3:
+Right after the home menu tree comes back (step 4) — starting about
+0.33s later, all landing within a 0.2-second burst — the client fetches
+icons for every home-menu item that has one. These are ordinary plain
+`GET` requests on port 9000, completely unrelated to the CometD channel.
+All 17 got a `200 OK` with real PNG/JPEG data:
 
 | Path | Content-Type | Size |
 |---|---|---|
 | `/plugins/Sounds/html/images/icon_225x225_m.png` | image/png | 20,113 bytes |
+| `/plugins/ExtendedBrowseModes/html/composers_225x225_m.png` | image/png | 15,516 bytes |
 | `/html/images/artists_225x225_m.png` | image/png | 18,563 bytes |
 | `/html/images/albums_225x225_m.png` | image/png | 21,337 bytes |
 | `/plugins/TuneIn/html/images/podcasts_225x225_m.png` | image/png | 18,895 bytes |
@@ -131,30 +105,62 @@ One fetch per home-menu item that has an icon — the size matches the
 | `/plugins/MyApps/html/images/icon_225x225_m.png` | image/png | 19,823 bytes |
 | `/plugins/ExtendedBrowseModes/html/icon_225x225_m.png` | image/png | 14,297 bytes |
 | `/plugins/DontStopTheMusic/html/images/icon_225x225_m.png` | image/png | 15,816 bytes |
-| `/plugins/ExtendedBrowseModes/html/composers_225x225_m.png` | image/png | 15,516 bytes |
 
-### List-row thumbnails (smaller size)
+The `225x225_m` size matches the `artworkspec` registered in step 3.
+Note that `artists_225x225_m.png` and `albums_225x225_m.png` appear here
+too — these are the generic My Music category tiles on the home screen,
+distinct from the artist- and album-*list* screens fetched in step 8.
 
-```
-GET /html/images/artists_90x90_m.png  ->  200 OK, image/png, 5,254 bytes
-```
-
-Same icon, smaller size — used for the row thumbnail once inside a
-scrollable list, rather than the large home-screen tile.
-
-### Album cover art
+## 6. Populating My Music → Artists
 
 ```
-GET /music/2557d132/cover_225x225_m  ->  200 OK, image/jpeg, 19,142 bytes
+/slim/request → ["browselibrary", "items", 0, 200,
+                  "role_id:ALBUMARTIST", "mode:artists", "menu:1", ...]
 ```
 
-`2557d132` matches the `icon-id` field returned in section 6's album
-JSON for "Livin' My Best Life" — this is the real cover art, fetched only
-once the browse reached that specific album, not a generic placeholder.
+Returned the two artists in the library: **Dylan Scott** and **Jimmy
+Buffet**, plus an "All Albums" entry.
 
-`artists_225x225_m.png` and `albums_225x225_m.png` are each fetched
-twice across the capture, consistent with the repeated session cycles
-noted in section 1.
+## 7. Drilling into one artist
+
+```
+/slim/request → ["browselibrary", "items", 0, 200,
+                  "role_id:ALBUMARTIST", "mode:albums", "artist_id:3", ...]
+```
+
+`artist_id:3` is Dylan Scott. This returned his one album, **"Livin' My
+Best Life."**
+
+The capture never issues a `mode:tracks` request, so it only shows
+auto-population down through Artists → one artist's Albums — not the
+final drill into that album's track listing (which would be the next
+user click).
+
+## 8. Artist/album screen icons and cover art
+
+A **second, separate wave** of artwork requests follows the browse
+requests from steps 6-7 — but not immediately. It starts about **6.5
+seconds later**, consistent with these icons being fetched once the
+corresponding list screens actually render on screen, rather than eagerly
+alongside the browse request itself:
+
+| Time after step 6-7 | Path | Content-Type | Size |
+|---|---|---|---|
+| +6.5s | `/html/images/artists_225x225_m.png` (again) | image/png | 18,563 bytes |
+| +6.6s | `/html/images/albums_225x225_m.png` (again) | image/png | 21,337 bytes |
+| +8.6s | `/html/images/artists_90x90_m.png` | image/png | 5,254 bytes |
+| +8.7s | `/music/2557d132/cover_225x225_m` | image/jpeg | 19,142 bytes |
+
+The repeated `artists`/`albums` fetches use the same `225x225_m` size as
+step 5, but this time for the *list screen* itself rather than the
+home-menu tile. The `90x90_m` request is a smaller size used for a
+list-row thumbnail. Finally, `2557d132` matches the `icon-id` returned in
+step 7's album JSON for "Livin' My Best Life" — this is the real cover
+art, fetched only once the browse actually reached that specific album.
+
+`artists_225x225_m.png` and `albums_225x225_m.png` being fetched twice
+across the capture (once in step 5, once here) is consistent with the
+repeated session cycles noted in step 1.
 
 ---
 
