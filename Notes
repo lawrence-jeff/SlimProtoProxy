@@ -1,0 +1,36 @@
+Here's the full sequence, reconstructed from the capture in chronological order. It breaks into two layers: the CometD/Bayeux session plumbing, and the actual LMS commands that ride on top of it.
+
+1. Session establishment (Bayeux handshake)
+
+Every session starts the same way, three messages back to back on a fresh connection:
+
+/meta/handshake — negotiates the CometD protocol version and gets back a clientId (e.g. d2f2988e)
+/meta/connect — opens the long-poll channel that lets the server push messages back
+/meta/subscribe to /<clientId>/** — subscribes the client to receive anything published on its own private channel namespace
+
+2. Server status subscription
+
+/slim/subscribe → ["serverstatus", 0, 50, "subscribe:60"] — asks LMS to keep pushing server-wide status (player count, library totals, version) every 60 seconds. This is what returned the "info total songs": 2, "info total artists": 3, "info total albums": 2 snapshot confirming your 2-song library.
+
+3. Player registration and artwork setup
+
+/slim/request → ["artworkspec", "add", "225x225_m", "jiveliteskin"] — registers the artwork size/format the UI wants for cover art
+/slim/subscribe → ["menustatus"] for the player's MAC address — subscribes to changes in the player's menu state
+/slim/subscribe → ["status", "-", 10, "menu:menu", ..., "subscribe:600"] and ["displaystatus", "subscribe:showbriefly"] — subscribes to ongoing player transport status and display updates
+
+4. Building the home menu
+
+/slim/request → ["menu", 0, 100, "direct:1"] — fetches the full home menu tree in one shot: My Music, Favorites, Radio, Settings, Random Mix, Search, etc. — everything you see on the home screen
+/slim/request → ["status", 0, 200, "menu:menu", ...] — pulls the current player status for the Now Playing screen
+
+5. Populating "My Music" → Artists
+
+/slim/request → ["browselibrary", "items", 0, 200, "role_id:ALBUMARTIST", "mode:artists", ...] — this is the one that returned your two artists: Dylan Scott and Jimmy Buffet, plus an "All Albums" entry
+
+6. Drilling into one artist
+
+/slim/request → ["browselibrary", "items", 0, 200, "role_id:ALBUMARTIST", "mode:albums", "artist_id:3", ...] — artist_id:3 is Dylan Scott; this returned his one album, "Livin' My Best Life."
+
+Notably, the capture never issues a mode:tracks request — so this represents auto-population down through Artists → one Artist's Albums, but doesn't show the final drill into that album's actual track listing. That would be the next click a user makes.
+
+One thing worth flagging: the full handshake→connect→subscribe→browse sequence above actually repeats three times in this capture, each with its own clientId (aef2bcfd, d2f2988e, b6b15f09) — two cycles happen within about 200ms of each other right at the start, and a third begins about 10 seconds later. That's consistent with either multiple subsystems (JiveLite's UI vs. the underlying player component) each opening their own independent CometD session, or a reconnect cycle — the capture alone doesn't tell us which, but it's worth keeping in mind if you're using this as the reference for how many concurrent sessions Music Assistant would need to expect from a single device.
