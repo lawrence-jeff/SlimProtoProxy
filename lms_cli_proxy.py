@@ -597,7 +597,36 @@ async def pump_http(reader, writer, conn_id, direction, quiet=False, body_previe
 # ---------------------------------------------------------------------------
 
 
-def _rewrite_discovery_name(data: bytes, new_name: bytes) -> bytes:
+def _rewrite_discovery_name(data: bytes, new_name: bytes = None, http_port: int = None, new_uuid: bytes = None) -> bytes:
+    """Rewrites NAME (if new_name given), JSON (if http_port given), and
+    UUID (if new_uuid given) in an extended discovery response.
+
+    JSON tells the client which port to use for the web UI/JSON-RPC/CometD
+    API - it MUST match wherever THIS PROXY's own HTTP listener actually is
+    (--http-listen-port), not whatever port the real backend server reports
+    about itself. Passing it through unmodified was a real bug: if the real
+    server's own HTTP port ever differs from the proxy's (e.g. it gets
+    moved to a non-default port for any reason), the client ends up trying
+    to reach "LMS Proxy" on a port the proxy isn't actually listening on at
+    all - a silent, total connection failure with nothing in any log to
+    explain why, since NAME correctly said "LMS Proxy" the whole time.
+
+    UUID is even more important to rewrite: verified directly against real
+    JiveLite source (SlimDiscoveryApplet.lua) - it tracks servers keyed by
+    UUID, not name or address ('local server = SlimServer(jnt, uuid, name,
+    version)'), then calls server:updateAddress(ip, port, name) on
+    whatever object that UUID resolves to. If "LMS Proxy" passes through
+    the real backend's own UUID unmodified, JiveLite doesn't see two
+    servers at all - it sees ONE server object whose address keeps getting
+    silently overwritten back and forth every time a fresh reply arrives
+    from either the proxy or the real server's own independent broadcast
+    (which the proxy can never suppress - discovery queries are LAN
+    broadcasts the real server hears directly, regardless of anything the
+    proxy does). Each address change forces that shared connection to
+    disconnect and reconnect at the new address - this was the actual
+    mechanism behind the repeated 'disconnect state=CONNECTED' / rapid
+    reconnect churn chased over much of this investigation, not mere
+    "confusion" from two servers existing."""
     if len(data) < 1 or data[0:1] != b"E":
         return data
 
@@ -605,17 +634,27 @@ def _rewrite_discovery_name(data: bytes, new_name: bytes) -> bytes:
     out = bytearray(b"E")
     i = 0
     n = len(body)
-    replaced = False
+    name_replaced = False
+    json_replaced = False
+    uuid_replaced = False
     while i + 5 <= n:
         tag = body[i:i + 4]
         length = body[i + 4]
         i += 5
         value = body[i:i + length]
         i += length
-        if tag == b"NAME" and not replaced:
+        if new_name is not None and tag == b"NAME" and not name_replaced:
             trimmed = new_name[:255]
             out += tag + bytes([len(trimmed)]) + trimmed
-            replaced = True
+            name_replaced = True
+        elif tag == b"JSON" and http_port is not None and not json_replaced:
+            port_bytes = str(http_port).encode()[:255]
+            out += tag + bytes([len(port_bytes)]) + port_bytes
+            json_replaced = True
+        elif tag == b"UUID" and new_uuid is not None and not uuid_replaced:
+            trimmed = new_uuid[:255]
+            out += tag + bytes([len(trimmed)]) + trimmed
+            uuid_replaced = True
         else:
             out += tag + bytes([length]) + value
     if i < n:
@@ -634,12 +673,14 @@ def _rewrite_discovery_name(data: bytes, new_name: bytes) -> bytes:
 
 
 class DiscoveryRelay(asyncio.DatagramProtocol):
-    def __init__(self, target_host, target_port, quiet=False, timeout=2.0, rename_to=None, pcap=None):
+    def __init__(self, target_host, target_port, quiet=False, timeout=2.0, rename_to=None, http_port=None, rename_uuid=None, pcap=None):
         self.target_host = target_host
         self.target_port = target_port
         self.quiet = quiet
         self.timeout = timeout
         self.rename_to = rename_to.encode() if rename_to else None
+        self.http_port = http_port  # the PROXY's own HTTP listen port - see _rewrite_discovery_name
+        self.rename_uuid = rename_uuid.encode() if rename_uuid else None
         self.pcap = pcap
         self.transport = None
         # Resolved once so we can recognize (and ignore) the real server's
@@ -714,11 +755,20 @@ class DiscoveryRelay(asyncio.DatagramProtocol):
                     logger.info("[%s] conn=%d UDP no response from target within %.1fs", ts(), conn_id, self.timeout)
                 return
 
-            if self.rename_to:
-                original = resp
-                resp = _rewrite_discovery_name(resp, self.rename_to)
-                if not self.quiet and resp != original:
-                    logger.info("[%s] conn=%d UDP rewrote server NAME to %r", ts(), conn_id, self.rename_to)
+            # Always rewritten, regardless of --udp-rename: JSON (port) and
+            # UUID must reflect THIS proxy's own identity, not whatever the
+            # real backend server reports about itself right now - see
+            # _rewrite_discovery_name's docstring for why passing either
+            # through unmodified is a real bug, not just cosmetic (UUID
+            # especially: JiveLite tracks servers BY uuid, so leaving it
+            # unmodified makes the client treat the proxy and the real
+            # server as the SAME server object, thrashing its address back
+            # and forth between the two on every discovery reply).
+            original = resp
+            resp = _rewrite_discovery_name(resp, self.rename_to, http_port=self.http_port, new_uuid=self.rename_uuid)
+            if not self.quiet and resp != original:
+                logger.info("[%s] conn=%d UDP rewrote discovery response (name=%r, http_port=%r, uuid=%r)",
+                            ts(), conn_id, self.rename_to, self.http_port, self.rename_uuid)
 
             if self.transport is not None:
                 self.transport.sendto(resp, addr)
@@ -733,10 +783,10 @@ class DiscoveryRelay(asyncio.DatagramProtocol):
             upstream_transport.close()
 
 
-async def start_udp_relay(listen_host, listen_port, target_host, target_port, quiet=False, rename_to=None, pcap=None):
+async def start_udp_relay(listen_host, listen_port, target_host, target_port, quiet=False, rename_to=None, http_port=None, rename_uuid=None, pcap=None):
     loop = asyncio.get_running_loop()
     transport, protocol = await loop.create_datagram_endpoint(
-        lambda: DiscoveryRelay(target_host, target_port, quiet, rename_to=rename_to, pcap=pcap),
+        lambda: DiscoveryRelay(target_host, target_port, quiet, rename_to=rename_to, http_port=http_port, rename_uuid=rename_uuid, pcap=pcap),
         local_addr=(listen_host, listen_port),
     )
     logger.info(
@@ -821,14 +871,15 @@ async def main_async(args, pcap):
         ))
     if not args.no_http:
         tasks.append(start_proxy(
-            args.listen_host, args.http_listen_port, args.target_host, args.http_target_port, "HTTP", pump_http,
+            args.listen_host, args.http_listen_port, args.http_target_host or args.target_host, args.http_target_port, "HTTP", pump_http,
             quiet=args.http_no_log, quiet_connect_log=args.http_no_log and args.http_no_connect_log,
             pump_kwargs={"body_preview": args.http_body_preview}, pcap=pcap,
         ))
     if not args.no_udp_discovery:
         tasks.append(start_udp_relay(
             args.listen_host, args.udp_listen_port, args.target_host, args.udp_target_port,
-            quiet=args.udp_no_log, rename_to=args.udp_rename, pcap=pcap,
+            quiet=args.udp_no_log, rename_to=args.udp_rename, http_port=args.http_listen_port,
+            rename_uuid=args.udp_rename_uuid or None, pcap=pcap,
         ))
 
     if not tasks:
@@ -856,6 +907,7 @@ def parse_args():
 
     p.add_argument("--http-listen-port", type=int, default=9000, help="HTTP listen port (default 9000)")
     p.add_argument("--http-target-port", type=int, default=9000, help="Real LMS HTTP port (default 9000)")
+    p.add_argument("--http-target-host", default=None, help="Override just the HTTP target's host, e.g. to point port 9000 at a different server (like a scaffold implementation) while CLI/SlimProto/UDP still go to --target-host (a real LMS). Defaults to --target-host if not given.")
     p.add_argument("--no-http", action="store_true", help="Disable the HTTP (9000) proxy entirely")
     p.add_argument("--http-no-log", action="store_true", help="Keep forwarding HTTP (9000) traffic but skip header/request logging")
     p.add_argument("--http-no-connect-log", action="store_true", help="With --http-no-log, also suppress connect/close lines for HTTP (only meaningful combined with --http-no-log)")
@@ -866,6 +918,14 @@ def parse_args():
     p.add_argument("--no-udp-discovery", action="store_true", help="Disable the UDP discovery relay entirely")
     p.add_argument("--udp-no-log", action="store_true", help="Keep relaying UDP discovery traffic but skip logging it")
     p.add_argument("--udp-rename", default=None, help="Rewrite the server NAME field in discovery responses to this string (e.g. 'LMS Proxy') so it's distinguishable from the real server in library pickers")
+    p.add_argument("--udp-rename-uuid", default="00000000-0000-4000-8000-000000000000",
+                    help="Rewrite the server UUID field in discovery responses to this value (default: a fixed synthetic "
+                         "placeholder). NOT just cosmetic like --udp-rename - JiveLite tracks servers BY this UUID "
+                         "(verified against real client source), so leaving it identical to the real backend server's own "
+                         "UUID makes the client treat the proxy and the real server as the SAME server object, silently "
+                         "overwriting its address back and forth between the two every time a discovery reply arrives from "
+                         "either one - this was the actual cause of repeated disconnect/reconnect churn, not mere confusion "
+                         "from two servers existing. Pass '' to disable this rewrite and let the real UUID through unmodified.")
 
     p.add_argument("--pcap-file", default=None, help="Also write all proxied traffic to this .pcap file (openable in Wireshark) - synthesized to look like a direct capture between the real client and the real server, with full HTTP/JSON decoding available via Wireshark's built-in dissectors. Runs independently of --log-file and the --*-no-log flags.")
 
