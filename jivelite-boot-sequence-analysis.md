@@ -1,180 +1,325 @@
-# JiveLite Boot Sequence — Capture Analysis
+# JiveLite / LMS Protocol Reference
 
-This document traces every request piCorePlayer/JiveLite makes during
-device boot and initial menu population, reconstructed from a packet
-capture taken with `lms_cli_proxy.py --pcap-file`. The test library
-consists of **2 songs by 2 artists** (Dylan Scott, Jimmy Buffet), which is
-reflected throughout the trace below.
+Everything learned about how a real piCorePlayer/JiveLite client and a real
+Lyrion/Logitech Media Server (LMS) actually talk to each other, reverse-
+engineered from packet captures taken with `lms_cli_proxy.py`. This is a
+reference document, organized by topic rather than chronologically — see the
+appendix for an annotated walkthrough of one specific boot capture.
 
-Two entirely separate mechanisms are involved:
-
-- **CometD/Bayeux over HTTP (`/cometd`)** — a persistent JSON-RPC-style
-  channel that drives all menu data, server status, and player status.
-- **Plain HTTP `GET` requests** — ordinary image fetches for icons and
-  album art, completely independent of the CometD channel.
-
-Both ride on the same TCP port (9000), but they are unrelated protocols
-layered on top of it. Steps below are in actual chronological order, with
-each artwork-fetching step placed right after the menu event that
-triggers it.
+Everything here describes **real LMS and real JiveLite behavior**, verified
+directly from the wire. It intentionally covers only the native protocol —
+nothing here is specific to any particular compatible-server implementation.
 
 ---
 
-## 1. Session establishment (Bayeux handshake)
+## 1. Two independent mechanisms, one TCP port
 
-Every session begins with the same three-message sequence on a fresh
+LMS clients don't talk to the server over just one channel, though both ride
+on the same TCP port (9000):
+
+- **CometD/Bayeux over HTTP (`/cometd`)** — a persistent JSON-RPC-style
+  channel that drives all menu data, server status, and player status.
+- **Plain HTTP `GET`** — ordinary image fetches for icons and album art,
+  completely independent of the CometD channel, and issued lazily (only once
+  a screen actually renders on-device, not eagerly alongside the browse
+  response that named the icon — observed gaps of several seconds between a
+  list populating and its icons being requested).
+
+---
+
+## 2. Connection architecture — a small, reused connection pool
+
+JiveLite does **not** open a new TCP connection per request. It maintains a
+small, named pool of persistent, reused connections per server, confirmed
+both from a real client's own debug logging (which names each connection)
+and from proxy captures showing many requests pipelined on one physical
 connection:
 
-| Channel | Purpose |
-|---|---|
-| `/meta/handshake` | Negotiates the CometD protocol version, returns a `clientId` |
-| `/meta/connect` | Opens the long-poll channel used for server-to-client pushes |
-| `/meta/subscribe` | Subscribes to `/<clientId>/**` — the client's own private channel namespace |
+| Connection role | Purpose | Behavior |
+|---|---|---|
+| `..._Chunked` | The **one** persistent `/meta/connect` stream | Held open indefinitely; every server-to-client push for the session's lifetime arrives as a new chunk on this single, never-ending HTTP response. |
+| `..._Request` | Dedicated, reused connection for `/cometd` POSTs (`/slim/subscribe`, `/slim/request`) | Multiple requests get pipelined onto this same connection sequentially over the session, not one connection per call. |
+| `...1`, `...2`, ... | A small generic pool for HTTP `GET` icon/image fetches | Reused and pipelined too — a real capture showed **17 separate icon requests all served on a single reused connection**, with several requests sent back-to-back before earlier responses even arrived, and the connection only closing once all 17 were done. A second pooled connection exists but is only opened if concurrent demand needs it. |
 
-**Note:** this full handshake→connect→subscribe→browse sequence actually
-repeats **three times** in the capture, each with a distinct `clientId`
-(`aef2bcfd`, `d2f2988e`, `b6b15f09`) — two cycles about 200ms apart right
-at the start, and a third beginning roughly 10 seconds later. This is
-consistent with multiple subsystems (JiveLite's UI vs. the underlying
-player component) each opening independent CometD sessions, though the
-capture alone doesn't confirm which.
+**Implication for anyone implementing a compatible server:** it must handle
+genuine HTTP/1.1 pipelining correctly (multiple requests arriving on one
+connection before responses are sent) and must not assume "one request per
+connection." A server that only handles one request per connection before
+closing it will appear to work in simple tests and then fail unpredictably
+once a client pipelines several requests at once.
 
-## 2. Server status subscription
+### Idle connection recycling is normal, not a bug signal
 
+JiveLite's own HTTP connection pool proactively closes connections it
+considers idle (own client-side debug log wording: `"closing idle
+connection"`, `"keep-alive timeout"`) and reconnects, redoing the Bayeux
+handshake/connect/subscribe sequence as needed. **This happens identically
+against real LMS and any other server** — a real capture showed this same
+idle-close-and-reconnect cycle affecting connections to real LMS at the same
+moments it affected connections to another server on the same network. A
+burst of several handshakes within a few hundred milliseconds of boot, or
+recurring roughly every ~10 seconds, is normal client housekeeping — not by
+itself evidence that a server is misbehaving.
+
+### The one thing real LMS does that's hard to replicate correctly
+
+Real LMS tolerates a **second** `/meta/connect` (a different `clientId`)
+reusing an already-open `_Chunked` connection, appending it as further
+chunks onto the *same* ongoing HTTP response rather than starting a new one.
+This is unusual — a raw TCP connection carrying two logical CometD sessions'
+worth of push data multiplexed onto one continuous chunked body, with no new
+HTTP header block for the second session. It is not expressible as ordinary
+HTTP/1.1 request/response framing (a connection can't legitimately carry a
+second full response while an earlier chunked one is still open), and
+attempting to hand-replicate it is a likely source of stream-corruption bugs
+(injecting a second header block mid-stream breaks the client's chunk
+decoder, causing a disconnect/reconnect). Building on a mature HTTP library
+that enforces correct framing sidesteps this entirely: the client's second
+connect attempt simply queues behind the first and is never processed,
+which in practice just causes the client to open a fresh connection for its
+second session instead — a normal, well-tolerated client behavior, not an
+error.
+
+---
+
+## 3. Bayeux/CometD message semantics
+
+### Handshake
+`/meta/handshake` is always sent as its own solo POST — never batched with
+anything else in any observed capture. Response includes:
+```json
+"advice": {"reconnect": "retry", "interval": 0, "timeout": 60000}
+```
+
+### Connect
+`/meta/connect` establishes (or re-establishes) the persistent stream.
+Response `advice.interval` is `5000` (ms). If a `/meta/subscribe` arrives
+batched in the same POST as the connect, its ack is delivered together with
+the connect ack as one combined chunk.
+
+### Subscribe
+`/meta/subscribe` — ack is **always** sent regardless of whether the
+client's message included an `id`.
+
+### `/slim/subscribe`
+- Ack is **always** sent (not gated on `id`), unlike `/slim/request`.
+- An **immediate snapshot** is pushed right after the ack.
+- The subscription then keeps receiving **periodic republished
+  snapshots** for its entire lifetime, at whatever interval the client
+  requested via a `subscribe:N` tag (seconds) — e.g. `subscribe:60` for
+  `serverstatus`, `subscribe:600` for `playerstatus`. `displaystatus` uses
+  `subscribe:showbriefly` — event-triggered, not interval-based.
+- A client that only ever receives the one initial snapshot and nothing
+  further has a legitimate reason to eventually treat the subscription (or
+  the connection carrying it) as stale.
+
+### `/slim/request`
+- Both the synchronous ack **and** the pushed result are gated on the
+  client's message having included an `id` at all. No `id` → neither is
+  sent (e.g. `artworkspec` is observed sent with no `id`, and gets no
+  response of any kind).
+- When `id` **is** present: the synchronous ack echoes it in its original
+  form (often an integer), but the **pushed result's `id` is stringified**
+  — a consistent quirk across every observed capture (likely an artifact of
+  the server's own implementation language), not something to "fix" when
+  replicating it.
+
+### `clientId` placement
+Most Bayeux channels carry `clientId` at the top level of the message.
+`/slim/subscribe` and `/slim/request` do **not** — the only place the
+client ID appears is embedded in `data.response`, shaped like
+`"/<clientId>/slim/<subtopic>"`.
+
+---
+
+## 4. Browse library views
+
+All `browselibrary` requests use **positional** pagination args, not
+tag:value pairs — `index` and `quantity` are the 3rd and 4th elements of
+the `cmd` array (right after `"items"`), e.g.:
+```json
+["browselibrary", "items", 0, 200, "mode:artists", "menu:1", ...]
+```
+The response's `"count"` is always the **full total**, never the window
+size — only `item_loop` and `"offset"` reflect the actual slice returned.
+
+### Artists list (`mode:artists`)
+- A synthetic **"All Albums"** entry is appended after the real artists.
+- Every plain artist row relies on a single shared `base.actions` object
+  (not per-item actions) covering `go`/`add`/`play`/`add-hold`/`more`/
+  `playControl`/`set-preset-0`..`9`.
+- Each item includes `"type": "playlist"`.
+
+### Albums list — two distinct variants depending on whether `artist_id` is present
+
+**Filtered (`mode:albums` + `artist_id`, browsing into one specific artist):**
+- `window.windowStyle`: `"home_menu"`
+- `text`: single line (just the album title — you already know the artist)
+- `base.actions`' params echo whatever context tags the request itself
+  carried (`role_id`, `menu_roles`, `menu_mode`, `artist_id`, `menu`) —
+  nothing more, nothing defaulted.
+
+**Unfiltered ("All Albums", `mode:albums`, no `artist_id`):**
+- `window.windowStyle`: `"icon_list"` — genuinely different from the
+  filtered case.
+- `text`: **two lines** — `"Album Title\nArtist Name"` — since a flat,
+  mixed-artist list needs to show whose album each one is.
+- Adds `"textkey"` (first letter of the title, for an alphabetical
+  jump-scroll bar) and a `"presetParams"` block (`favorites_title`,
+  `favorites_url`, `favorites_type`, `icon`) — neither present in the
+  filtered case.
+- `base.actions`' params are genuinely sparse — confirmed directly from a
+  real LMS response: just `{"mode": "tracks", "menu": 1}`. No `role_id` or
+  `menu_roles` at all, even though those are otherwise a near-universal
+  convention elsewhere in the protocol. Don't "correct" this when
+  replicating it — it's how the real server actually behaves.
+
+**Both variants**, every album item includes:
+- `"performance": ""` in `commonParams` — always present, even for
+  non-classical albums with no actual performance value.
+- **Both** `"icon"` (the full wrapped path, `music/<icon-id>/cover`) **and**
+  `"icon-id"` (the bare hash alone) — real LMS sends both fields on every
+  item, unconditionally.
+- `"type": "playlist"`.
+
+### Tracks list (`mode:tracks` + `album_id`)
+- `window.windowStyle`: `"text_list"`.
+- Each item carries its own `"goAction": "play"` rather than relying on a
+  shared default `base.actions` entry — selecting a track plays it, it
+  doesn't browse deeper, so the per-item action differs from every other
+  list type.
+- Per-item `playallParams` (carries `play_index`) and `presetParams`.
+
+---
+
+## 5. Icon & artwork conventions
+
+- The client registers a size/format once per session via
+  `/slim/request → ["artworkspec", "add", "<W>x<H>_<mode>", "jiveliteskin"]`
+  (e.g. `225x225_m`) — every subsequent icon/art request uses this exact
+  suffix.
+- Generic UI chrome icons: `/html/images/<name>_<size>.png` or
+  `/plugins/<plugin>/html/images/<name>_<size>.png`.
+- Album cover art: `/music/<icon-id>/cover_<size>` — note **no file
+  extension at all** on cover-art paths, unlike chrome icons.
+- Real cache headers: cover art gets `max-age=31536000` (1 year); generic
+  chrome icons get `max-age=86400` (1 day).
+- Icons for a given screen are fetched lazily, only once that screen
+  actually renders — not eagerly alongside the browse response that
+  contains the icon reference.
+
+---
+
+## 6. Server discovery & identity (UDP, port 3483)
+
+The extended discovery response is a single `'E'`-prefixed byte, followed by
+TLV-encoded fields (4-byte tag + 1-byte length + value), at minimum:
+`NAME`, `JSON` (the HTTP/CometD port), `VERS`, `UUID`.
+
+**The client tracks servers by `UUID`, not by name or address.** Confirmed
+directly from real client source (`SlimDiscoveryApplet.lua`):
+```lua
+local server = SlimServer(jnt, uuid, name, version)
+self:_serverUpdateAddress(server, ip, port, name)
+```
+Every discovery reply with a given UUID resolves to the same server object
+internally, and `updateAddress()` is called on it — updating wherever the
+client currently thinks that server lives. Two genuinely different servers
+sharing the same UUID are not treated as two servers at all: they're the
+same server object, and its address gets silently overwritten back and
+forth every time a fresh reply arrives from either one. Each address change
+forces any open connection to that "server" to disconnect and reconnect at
+the new address.
+
+Discovery queries are LAN **broadcasts** — every listener on the same
+network segment hears and can answer them directly and independently.
+Nothing about how a single server responds can suppress a different,
+unrelated server also answering the same broadcast.
+
+---
+
+## Appendix: Annotated boot sequence trace
+
+This section preserves the original capture walkthrough this document grew
+out of — a concrete, chronological trace of one real boot sequence against
+a small (2-song, 2-artist) test library, useful as a worked example
+alongside the topic reference above.
+
+### A1. Session establishment
+
+Every session begins with the same three-message sequence on a fresh
+connection: `/meta/handshake` → `/meta/connect` → `/meta/subscribe` (to
+`/<clientId>/**`). In the reference capture this full cycle repeated three
+times with distinct `clientId`s — two cycles ~200ms apart right at the
+start, a third ~10 seconds later. Consistent with the idle-connection
+recycling behavior described in §2 above, not evidence of a problem.
+
+### A2. Server status subscription
 ```
 /slim/subscribe → ["serverstatus", 0, 50, "subscribe:60"]
 ```
+Confirmed the test library: `"info total songs": 2, "info total artists": 3, "info total albums": 2`.
 
-Asks LMS to push server-wide status (player count, library totals,
-version) every 60 seconds. The response confirms the test library:
-
-```json
-"info total songs": 2, "info total artists": 3, "info total albums": 2
-```
-
-## 3. Player registration and artwork setup
+### A3. Player registration and artwork setup
 
 | Request | Purpose |
 |---|---|
-| `/slim/request → ["artworkspec", "add", "225x225_m", "jiveliteskin"]` | Registers the artwork size/format the UI will request — this exact size (`225x225_m`) shows up as the filename suffix on every icon fetch in step 5 |
-| `/slim/subscribe → ["menustatus"]` (by player MAC) | Subscribes to changes in the player's menu state |
-| `/slim/subscribe → ["status", "-", 10, "menu:menu", ..., "subscribe:600"]` | Subscribes to ongoing player transport status |
-| `/slim/subscribe → ["displaystatus", "subscribe:showbriefly"]` | Subscribes to display updates |
+| `/slim/request → ["artworkspec", "add", "225x225_m", "jiveliteskin"]` | Registers the artwork size/format used for every subsequent icon fetch |
+| `/slim/subscribe → ["menustatus"]` (by player MAC) | Player menu-state changes |
+| `/slim/subscribe → ["status", "-", 10, "menu:menu", ..., "subscribe:600"]` | Ongoing player transport status |
+| `/slim/subscribe → ["displaystatus", "subscribe:showbriefly"]` | Display updates |
 
-## 4. Building the home menu
-
+### A4. Building the home menu
 ```
 /slim/request → ["menu", 0, 100, "direct:1"]
 ```
-
-Fetches the entire home menu tree in one shot — My Music, Favorites,
-Radio, Settings, Random Mix, Search, and every plugin-contributed entry
-(TuneIn's radio categories, Sounds, RemoteLibrary, MyApps, etc.). This is
-the response that determines what icons need fetching in step 5.
-
+Fetches the entire home menu tree in one shot (My Music, Favorites, Radio,
+Settings, Random Mix, Search, every plugin-contributed entry). This
+response is what determines which icons need fetching next.
 ```
 /slim/request → ["status", 0, 200, "menu:menu", "useContextMenu:1"]
 ```
+Current player status snapshot for the Now Playing screen.
 
-Pulls the current player status snapshot for the Now Playing screen.
+### A5. Home menu icon fetching
 
-## 5. Home menu icon fetching
+Starting ~0.33s after the home menu tree arrives, all landing within a
+0.2-second burst: 17 plain `GET` requests, all `200 OK` with real
+PNG/JPEG data, all using the `225x225_m` suffix registered in A3 — e.g.
+`/plugins/Sounds/html/images/icon_225x225_m.png`,
+`/html/images/artists_225x225_m.png`, `/html/images/albums_225x225_m.png`,
+several `/plugins/TuneIn/html/images/radio*_225x225_m.png` variants, and
+similar for `RemoteLibrary`, `MyApps`, `ExtendedBrowseModes`,
+`DontStopTheMusic`. All 17 were pipelined onto a single reused connection
+(see §2).
 
-Right after the home menu tree comes back (step 4) — starting about
-0.33s later, all landing within a 0.2-second burst — the client fetches
-icons for every home-menu item that has one. These are ordinary plain
-`GET` requests on port 9000, completely unrelated to the CometD channel.
-All 17 got a `200 OK` with real PNG/JPEG data:
-
-| Path | Content-Type | Size |
-|---|---|---|
-| `/plugins/Sounds/html/images/icon_225x225_m.png` | image/png | 20,113 bytes |
-| `/plugins/ExtendedBrowseModes/html/composers_225x225_m.png` | image/png | 15,516 bytes |
-| `/html/images/artists_225x225_m.png` | image/png | 18,563 bytes |
-| `/html/images/albums_225x225_m.png` | image/png | 21,337 bytes |
-| `/plugins/TuneIn/html/images/podcasts_225x225_m.png` | image/png | 18,895 bytes |
-| `/plugins/TuneIn/html/images/radiosearch_225x225_m.png` | image/png | 16,642 bytes |
-| `/plugins/TuneIn/html/images/radioworld_225x225_m.png` | image/png | 27,368 bytes |
-| `/plugins/TuneIn/html/images/radiotalk_225x225_m.png` | image/png | 12,141 bytes |
-| `/plugins/TuneIn/html/images/radiosports_225x225_m.png` | image/png | 25,622 bytes |
-| `/plugins/TuneIn/html/images/radionews_225x225_m.png` | image/png | 19,203 bytes |
-| `/plugins/TuneIn/html/images/radiomusic_225x225_m.png` | image/png | 21,431 bytes |
-| `/plugins/TuneIn/html/images/radiolocal_225x225_m.png` | image/png | 19,512 bytes |
-| `/plugins/TuneIn/html/images/radiopresets_225x225_m.png` | image/png | 13,991 bytes |
-| `/plugins/RemoteLibrary/html/icon_225x225_m.png` | image/png | 13,354 bytes |
-| `/plugins/MyApps/html/images/icon_225x225_m.png` | image/png | 19,823 bytes |
-| `/plugins/ExtendedBrowseModes/html/icon_225x225_m.png` | image/png | 14,297 bytes |
-| `/plugins/DontStopTheMusic/html/images/icon_225x225_m.png` | image/png | 15,816 bytes |
-
-The `225x225_m` size matches the `artworkspec` registered in step 3.
-Note that `artists_225x225_m.png` and `albums_225x225_m.png` appear here
-too — these are the generic My Music category tiles on the home screen,
-distinct from the artist- and album-*list* screens fetched in step 8.
-
-## 6. Populating My Music → Artists
-
+### A6. Populating My Music → Artists
 ```
 /slim/request → ["browselibrary", "items", 0, 200,
                   "role_id:ALBUMARTIST", "mode:artists", "menu:1", ...]
 ```
+Returned the two artists (Dylan Scott, Jimmy Buffet) plus the synthetic
+"All Albums" entry.
 
-Returned the two artists in the library: **Dylan Scott** and **Jimmy
-Buffet**, plus an "All Albums" entry.
-
-## 7. Drilling into one artist
-
+### A7. Drilling into one artist
 ```
 /slim/request → ["browselibrary", "items", 0, 200,
                   "role_id:ALBUMARTIST", "mode:albums", "artist_id:3", ...]
 ```
+`artist_id:3` = Dylan Scott. Returned his one album, "Livin' My Best Life."
+(The reference capture never issued a `mode:tracks` request, so it doesn't
+show the final drill into that album's track listing.)
 
-`artist_id:3` is Dylan Scott. This returned his one album, **"Livin' My
-Best Life."**
+### A8. Artist/album screen icons and cover art
 
-The capture never issues a `mode:tracks` request, so it only shows
-auto-population down through Artists → one artist's Albums — not the
-final drill into that album's track listing (which would be the next
-user click).
+A second, separate wave of artwork requests follows — starting about 6.5
+seconds after the browse requests in A6/A7, not immediately, consistent
+with icons being fetched once the list screen actually renders rather than
+eagerly:
 
-## 8. Artist/album screen icons and cover art
-
-A **second, separate wave** of artwork requests follows the browse
-requests from steps 6-7 — but not immediately. It starts about **6.5
-seconds later**, consistent with these icons being fetched once the
-corresponding list screens actually render on screen, rather than eagerly
-alongside the browse request itself:
-
-| Time after step 6-7 | Path | Content-Type | Size |
-|---|---|---|---|
-| +6.5s | `/html/images/artists_225x225_m.png` (again) | image/png | 18,563 bytes |
-| +6.6s | `/html/images/albums_225x225_m.png` (again) | image/png | 21,337 bytes |
-| +8.6s | `/html/images/artists_90x90_m.png` | image/png | 5,254 bytes |
-| +8.7s | `/music/2557d132/cover_225x225_m` | image/jpeg | 19,142 bytes |
-
-The repeated `artists`/`albums` fetches use the same `225x225_m` size as
-step 5, but this time for the *list screen* itself rather than the
-home-menu tile. The `90x90_m` request is a smaller size used for a
-list-row thumbnail. Finally, `2557d132` matches the `icon-id` returned in
-step 7's album JSON for "Livin' My Best Life" — this is the real cover
-art, fetched only once the browse actually reached that specific album.
-
-`artists_225x225_m.png` and `albums_225x225_m.png` being fetched twice
-across the capture (once in step 5, once here) is consistent with the
-repeated session cycles noted in step 1.
-
----
-
-## Summary for implementation purposes
-
-Two independent mechanisms need to be emulated for a compatible
-LMS-like server:
-
-1. **CometD/Bayeux over `/cometd`** — handshake, connect, subscribe, and
-   `slim/request`/`slim/subscribe` commands carrying the same command
-   vocabulary as the classic text CLI (`artists`, `albums`, `menu`,
-   `status`, `browselibrary`, etc.), wrapped in Bayeux envelopes.
-2. **Plain HTTP `GET`** — icon and cover art fetches at
-   `/plugins/<plugin>/html/images/<name>_<size>.png`,
-   `/html/images/<name>_<size>.png`, and `/music/<icon-id>/cover_<size>`
-   paths, sized according to whatever `artworkspec` the client registered
-   at connect time.
+| Offset | Path | Note |
+|---|---|---|
+| +6.5s | `/html/images/artists_225x225_m.png` | Re-fetched for the list screen itself, not the home-menu tile |
+| +6.6s | `/html/images/albums_225x225_m.png` | Same |
+| +8.6s | `/html/images/artists_90x90_m.png` | Smaller size, for a list-row thumbnail |
+| +8.7s | `/music/2557d132/cover_225x225_m` | Real cover art — `2557d132` matches the `icon-id` from A7's album JSON |
