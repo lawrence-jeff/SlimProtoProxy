@@ -49,10 +49,57 @@ without altering what either side actually sends or receives:
   recognizes and drops these automatically instead of relaying them back
   to the server under a different name, which would otherwise create a
   confusing phantom "peer server" entry.
-- **Server name rewriting.** `--udp-rename "LMS Proxy"` rewrites the
-  `NAME` field in discovery responses so the proxy is instantly
-  distinguishable from the real server in client-side library/server
-  pickers.
+- **HTTP traffic can be redirected to a completely different backend.**
+  `--http-target-host` (and `--http-target-port`) let port 9000 traffic
+  go somewhere other than `--target-host` — e.g. a test/scaffold server
+  implementing the JSON-RPC/CometD API on its own, while SlimProto, the
+  CLI, and UDP discovery continue relaying to a real LMS instance for
+  everything else the client needs before it'll fully boot (player
+  registration, heartbeats, etc.). This is the setup used to build and
+  test an LMS-compatible scaffold server against a real device, without
+  needing to reimplement SlimProto or the CLI just to get that far.
+  ```
+  python3 lms_cli_proxy.py --target-host 192.168.1.50 \
+    --http-target-host 127.0.0.1 --http-target-port 9001 \
+    --udp-rename "LMS Proxy"
+  ```
+- **Server identity rewriting.** The proxy can rewrite three fields in
+  UDP discovery responses so the traffic it relays presents a distinct,
+  self-consistent server identity, separate from whatever it's actually
+  forwarding to:
+  - `--udp-rename NAME` — rewrites the `NAME` field (e.g. `"LMS Proxy"`)
+    so it's instantly distinguishable from the real server in
+    client-side library/server pickers.
+  - **`JSON` (the advertised HTTP port) is always corrected** to match
+    `--http-listen-port`, regardless of `--udp-rename`. Discovery
+    replies otherwise echo whatever port the *real* backend reports
+    about itself — harmless if it happens to match the proxy's own
+    listen port, but a silent, total connection failure the moment it
+    doesn't (e.g. if the real server's HTTP port ever gets moved for any
+    reason). Nothing in any log explains this on its own, since the
+    server's own name is still reported correctly - only the port is
+    wrong.
+  - `--udp-rename-uuid` (defaults to a fixed placeholder,
+    `00000000-0000-4000-8000-000000000000`) rewrites the `UUID` field.
+    This one isn't cosmetic: real JiveLite/SqueezePlay clients track
+    servers **by this UUID**, not by name or address (confirmed
+    directly from the client's own source:
+    `SlimServer(jnt, uuid, name, version)` followed by
+    `server:updateAddress(ip, port, name)` on whatever object that UUID
+    resolves to). If the proxy's UUID matches the real backend's own
+    (which it does by default unless rewritten), the client doesn't see
+    two distinct servers at all — it sees **one** server object whose
+    address gets silently overwritten back and forth every time a fresh
+    discovery reply arrives from either the proxy or the real server's
+    own independent broadcast (which the proxy can never suppress,
+    since discovery queries are LAN broadcasts every listener answers
+    directly - not something relayed through the proxy at all). Each
+    address flip forces whatever connection was open to disconnect and
+    reconnect at the new address - in practice this showed up as
+    repeated, rapid disconnect/reconnect churn that looked like a
+    timing or reliability problem, and had nothing to do with either.
+    Pass `--udp-rename-uuid ''` to disable this rewrite and let the
+    real UUID through unmodified.
 - **Wireshark-ready PCAP capture.** `--pcap-file capture.pcap` writes a
   standard pcap file alongside the text log, hand-synthesized (no scapy/
   dpkt dependency) to look like a **direct** capture between the real
@@ -82,7 +129,7 @@ without altering what either side actually sends or receives:
 Point the client (e.g. piCorePlayer's manual server/library address) at the
 machine running this proxy instead of at the real LMS server directly:
 
-```bash
+```
 python3 lms_cli_proxy.py --target-host 192.168.1.50 --log-file lms.log
 ```
 
@@ -95,7 +142,7 @@ forward to the same ports on the real server.
 Capture everything to Wireshark, rename the proxy so it's identifiable, and
 quiet down the noisy SlimProto heartbeat traffic in the text log:
 
-```bash
+```
 python3 lms_cli_proxy.py \
   --target-host 192.168.1.50 \
   --slim-no-log \
@@ -107,7 +154,7 @@ python3 lms_cli_proxy.py \
 Only care about the CometD/JSON-RPC traffic on port 9000, with a large
 body preview so you can actually read the menu payloads:
 
-```bash
+```
 python3 lms_cli_proxy.py \
   --target-host 192.168.1.50 \
   --no-cli --no-slim \
@@ -115,10 +162,26 @@ python3 lms_cli_proxy.py \
   --log-file lms.log
 ```
 
+Test a from-scratch server implementation of the CometD/JSON-RPC API
+against a real client, while still relying on a real LMS instance for
+everything else (SlimProto, the CLI, UDP discovery) the client needs
+before it'll fully boot — this is the setup that made it possible to
+build and validate an LMS-compatible scaffold server entirely against
+real device behavior, one capture at a time:
+
+```
+python3 lms_cli_proxy.py \
+  --target-host 192.168.1.50 \
+  --http-target-host 127.0.0.1 --http-target-port 9001 \
+  --udp-rename "LMS Proxy" \
+  --pcap-file lms_capture.pcap \
+  --log-file lms.log
+```
+
 ### Full option reference
 
 ```
---target-host HOST        Real LMS server host/IP (required)
+--target-host HOST         Real LMS server host/IP (required)
 --listen-host HOST         Address to listen on (default 0.0.0.0)
 
 --cli-listen-port PORT     CLI listen port (default 9090)
@@ -133,6 +196,11 @@ python3 lms_cli_proxy.py \
 
 --http-listen-port PORT    HTTP listen port (default 9000)
 --http-target-port PORT    Real LMS HTTP port (default 9000)
+--http-target-host HOST    Override just the HTTP target's host, e.g. to
+                            point port 9000 at a different server (like a
+                            scaffold implementation) while CLI/SlimProto/UDP
+                            still go to --target-host. Defaults to
+                            --target-host if not given.
 --no-http                  Disable the HTTP (9000) proxy entirely
 --http-no-log              Keep forwarding, but skip header/request logging
 --http-no-connect-log      With --http-no-log, also hide connect/close lines
@@ -142,8 +210,15 @@ python3 lms_cli_proxy.py \
 --udp-target-port PORT     Real LMS UDP discovery port (default 3483)
 --no-udp-discovery         Disable the UDP discovery relay entirely
 --udp-no-log               Keep relaying, but skip logging it
---udp-rename NAME           Rewrite the server NAME field in discovery
-                             responses (e.g. "LMS Proxy")
+--udp-rename NAME          Rewrite the server NAME field in discovery
+                            responses (e.g. "LMS Proxy")
+--udp-rename-uuid UUID     Rewrite the server UUID field in discovery
+                            responses (default: a fixed placeholder). Not
+                            cosmetic - see "Server identity rewriting" above.
+                            Pass '' to disable and let the real UUID through.
+                            (The JSON/port field is always corrected to
+                            --http-listen-port, unconditionally - no flag
+                            needed to enable that part.)
 
 --pcap-file PATH            Also write all proxied traffic to this .pcap
                              file, openable in Wireshark
@@ -159,7 +234,7 @@ persistent CometD streaming transport, and since LMS concatenates multiple
 JSON documents back-to-back in one body with no separator, which
 `json.loads()` alone can't parse). No dependencies.
 
-```bash
+```
 python3 pcap_json_extract.py capture.pcap --grep "some artist name"
 python3 pcap_json_extract.py capture.pcap --port 9000
 ```
@@ -169,18 +244,20 @@ target host/port and reports whether it answers, useful for isolating
 whether a discovery failure is on the proxy's side or the real server's
 side.
 
-```bash
+```
 python3 test_udp_discovery.py 192.168.1.50
 ```
 
 ## How it works
 
 Each protocol gets its own async TCP or UDP relay: bytes are forwarded
-byte-for-byte in both directions (nothing is altered on the wire), while a
-protocol-aware parser runs alongside purely for logging purposes — splitting
-CLI text into lines, decoding SlimProto's tag+length framing, and walking
-HTTP's request/response/chunked framing to produce a readable summary and
-body preview per message.
+byte-for-byte in both directions (nothing is altered on the wire, other
+than the specific UDP discovery fields covered above when explicitly
+requested or, for the JSON port field, always), while a protocol-aware
+parser runs alongside purely for logging purposes — splitting CLI text
+into lines, decoding SlimProto's tag+length framing, and walking HTTP's
+request/response/chunked framing to produce a readable summary and body
+preview per message.
 
 ## Background
 
@@ -190,4 +267,9 @@ Assistant Music Assistant integration with LMS-compatible library browsing.
 It turned out JiveLite's menu system is driven primarily by a CometD/Bayeux
 session over HTTP (`/cometd`), not the classic text CLI — a detail this
 proxy's traffic capture made possible to confirm directly from the wire
-rather than from documentation or guesswork.
+rather than from documentation or guesswork. The same capture-driven
+approach later tracked down two much subtler issues that had nothing to do
+with the JSON payloads themselves: a UDP discovery response silently
+advertising the wrong HTTP port after the real server was moved to a
+non-default one, and a UUID collision that made two genuinely different
+servers look like one to the client's own connection-tracking logic.
